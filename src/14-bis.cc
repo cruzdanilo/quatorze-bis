@@ -16,17 +16,24 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include <libretro.h>
 #include <encodings/utf.h>
+#include <glsym/glsym.h>
 #include <v8.h>
 #include <libplatform/libplatform.h>
 
+#include "base/global.h"
+#include "base/console.h"
+
 static v8::Platform* platform;
-static v8::Isolate::CreateParams create_params;
 static v8::Isolate* isolate;
+static v8::ArrayBuffer::Allocator* allocator;
 static v8::Persistent<v8::Context> persistent_context;
-static uint32_t *frame_buf;
+static unsigned width  = 640;
+static unsigned height = 480;
+static struct retro_hw_render_callback hw_render;
 
 static retro_video_refresh_t video_cb;
 static retro_audio_sample_t audio_cb;
@@ -34,26 +41,19 @@ static retro_audio_sample_batch_t audio_batch_cb;
 static retro_environment_t environ_cb;
 static retro_input_poll_t input_poll_cb;
 static retro_input_state_t input_state_cb;
-static retro_log_printf_t log_cb;
-static void log_null(enum retro_log_level level, const char *fmt, ...) {}
 
 void retro_init(void) {
-  struct retro_log_callback log;
-  if (environ_cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log))
-     log_cb = log.log;
-  else
-     log_cb = log_null;
+  quatorzebis::Console::Initialize(environ_cb);
 
   v8::V8::InitializeICUDefaultLocation(".");
   v8::V8::InitializeExternalStartupData(".");
   platform = v8::platform::CreateDefaultPlatform();
   v8::V8::InitializePlatform(platform);
   v8::V8::Initialize();
-  create_params.array_buffer_allocator =
-      v8::ArrayBuffer::Allocator::NewDefaultAllocator();
-  isolate = v8::Isolate::New(create_params);
-
-  frame_buf = new uint32_t[640 * 480]();
+  allocator = v8::ArrayBuffer::Allocator::NewDefaultAllocator();
+  v8::Isolate::CreateParams params;
+  params.array_buffer_allocator = allocator;
+  isolate = v8::Isolate::New(params);
 }
 
 void retro_deinit(void) {
@@ -61,23 +61,22 @@ void retro_deinit(void) {
   v8::V8::Dispose();
   v8::V8::ShutdownPlatform();
   delete platform;
-  delete create_params.array_buffer_allocator;
-
-  delete[] frame_buf;
+  delete allocator;
 }
 
 unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 
 void retro_set_controller_port_device(unsigned port, unsigned device) {
-  log_cb(RETRO_LOG_INFO, "Plugging device %u into port %u.\n", device, port);
+  (void)port;
+  (void)device;
 }
 
 void retro_get_system_info(struct retro_system_info *info) {
   memset(info, 0, sizeof(*info));
-  info->library_name = "14-bis (quatorze-bis)";
+  info->library_name = "14-bis";
   info->library_version = "v1";
   info->need_fullpath = false;
-  info->valid_extensions = NULL;
+  info->valid_extensions = "js";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info) {
@@ -87,19 +86,16 @@ void retro_get_system_av_info(struct retro_system_av_info *info) {
   };
 
   info->geometry = (struct retro_game_geometry) {
-    .base_width = 640,
-    .base_height = 480,
-    .max_width = 640,
-    .max_height = 480,
-    .aspect_ratio = 4.0 / 3.0,
+    .base_width = width,
+    .base_height = height,
+    .max_width = width,
+    .max_height = height,
+    .aspect_ratio = static_cast<float>(width) / height,
   };
 }
 
 void retro_set_environment(retro_environment_t cb) {
   environ_cb = cb;
-
-  bool no_rom = true;
-  cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_rom);
 }
 
 void retro_set_audio_sample(retro_audio_sample_t cb) {
@@ -125,43 +121,73 @@ void retro_set_video_refresh(retro_video_refresh_t cb) {
 void retro_run(void) {
   input_poll_cb();
 
-  if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP)) {
-    v8::Isolate::Scope isolate_scope(isolate);
-    // create a stack-allocated handle scope
-    v8::HandleScope handle_scope(isolate);
-    // create a new context
-    v8::Local<v8::Context> context = persistent_context.Get(isolate);
-    // enter the context for compiling and running the hello world script
-    v8::Context::Scope context_scope(context);
-    // create a string containing the javascript source code
-    v8::Local<v8::String> source =
-        v8::String::NewFromUtf8(isolate, "'hello' + ', world!'",
-                                v8::NewStringType::kNormal).ToLocalChecked();
-    // compile the source code
-    v8::Local<v8::Script> script =
-        v8::Script::Compile(context, source).ToLocalChecked();
-    // run the script to get the result
-    v8::Local<v8::Value> result = script->Run(context).ToLocalChecked();
-    // convert the result to an ascii c string and print it
-    v8::String::Value utf16(result);
-    char *cstr = new char[utf16.length() + 1];
-    utf16_to_char_string(*utf16, cstr, utf16.length() + 1);
-    log_cb(RETRO_LOG_INFO, "%s\n", cstr);
-    delete[] cstr;
-  }
+  glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
+  glClearColor(0.3, 0.4, 0.5, 1.0);
+  glViewport(0, 0, width, height);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
-  video_cb(frame_buf, 640, 480, sizeof(uint32_t) * 640);
+  video_cb(RETRO_HW_FRAME_BUFFER_VALID, width, height, 0);
+}
+
+static void context_reset(void) {
+  quatorzebis::Console::Log("context reset\n");
+  rglgen_resolve_symbols(hw_render.get_proc_address);
+}
+
+static void context_destroy(void) {
+  quatorzebis::Console::Log("context destroy\n");
 }
 
 bool retro_load_game(const struct retro_game_info *info) {
+  enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+  if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) {
+    quatorzebis::Console::Log("xrgb8888 is not supported.\n");
+    return false;
+  }
+
+  hw_render.context_type = RETRO_HW_CONTEXT_OPENGL;
+  hw_render.context_reset = context_reset;
+  hw_render.context_destroy = context_destroy;
+  hw_render.depth = true;
+  hw_render.stencil = true;
+  hw_render.bottom_left_origin = true;
+  if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render)) {
+    quatorzebis::Console::Log("opengl is not supported\n");
+    return false;
+  }
+
   v8::Isolate::Scope isolate_scope(isolate);
-  // create a stack-allocated handle scope
   v8::HandleScope handle_scope(isolate);
-  // create a new context
-  v8::Local<v8::Context> context = v8::Context::New(isolate);
+  v8::Local<v8::Context> context = v8::Context::New(isolate, NULL,
+      quatorzebis::global::CreateTemplate(isolate));
+  if (context.IsEmpty()) {
+    quatorzebis::Console::Log("error creating v8 context\n");
+    return false;
+  }
   persistent_context.Reset(isolate, context);
-  log_cb(RETRO_LOG_INFO, "Loaded game!\n");
-  (void)info;
+
+  v8::TryCatch try_catch(isolate);
+  v8::Context::Scope context_scope(context);
+  v8::Local<v8::String> source =
+      v8::String::NewFromUtf8(isolate,
+                              reinterpret_cast<const char *>(info->data),
+                              v8::NewStringType::kNormal,
+                              info->size).ToLocalChecked();
+  v8::Local<v8::Script> script;
+  v8::Local<v8::Value> result;
+  if (!v8::Script::Compile(context, source).ToLocal(&script)) {
+    result = try_catch.Exception();
+  } else {
+    if (!script->Run(context).ToLocal(&result)) {
+      result = try_catch.Exception();
+    }
+  }
+  v8::String::Value utf16(result);
+  char *cstr = new char[utf16.length() + 1];
+  utf16_to_char_string(*utf16, cstr, utf16.length() + 1);
+  quatorzebis::Console::Log(cstr);
+  delete[] cstr;
+
   return true;
 }
 

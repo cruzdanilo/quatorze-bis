@@ -32,8 +32,10 @@
 *.app
 
 # 14-bis
-/third_party/v8
-.gclient*
+/_*
 /*.bin
 /*.dat
+/third_party/v8
+.gclient*
 .clang_complete
+CPPLINT.cfg
